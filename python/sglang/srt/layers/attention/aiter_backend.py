@@ -655,21 +655,24 @@ class AiterAttnBackend(AttentionBackend):
                     run_graph=False,
                 )
             else:
-                self.indices_updater_prefill.update(
+                # Non-MLA target_verify: generate correct kv/qo indices including draft tokens
+                draft_num = spec_info.draft_token_num
+                kv_lens = forward_batch.seq_lens + draft_num
+                kv_indices, kv_indptr, qo_indptr, _ = spec_info.generate_attn_arg_prefill(
                     forward_batch.req_pool_indices,
                     forward_batch.seq_lens,
                     forward_batch.seq_lens_sum,
-                    prefix_lens=None,
-                    encoder_lens=forward_batch.encoder_lens,
-                    spec_info=forward_batch.spec_info,
+                    self.req_to_token,
                 )
+                # Update self.qo_indptr in-place (forward_extend reads self.qo_indptr directly)
+                self.qo_indptr[: bs + 1] = qo_indptr
                 self.forward_metadata = ForwardMetadata(
-                    self.indices_updater_prefill.kv_indptr,
-                    self.indices_updater_prefill.kv_indices,
+                    kv_indptr,
+                    kv_indices,
                     None,
                     None,
-                    self.indices_updater_prefill.max_q_len,
-                    self.indices_updater_prefill.max_kv_len,
+                    draft_num,
+                    kv_lens.max().item(),
                 )
         else:
             prefix_lens = forward_batch.extend_prefix_lens
@@ -912,13 +915,15 @@ class AiterAttnBackend(AttentionBackend):
                     dtype=torch.int32,
                     device=self.device,
                 )
+                # MLA: kv cache includes both original tokens + draft tokens
+                kv_lens = seq_lens + self.num_draft_tokens
                 kv_indptr = self.kv_indptr[: bs + 1]
-                kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+                kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
                 kv_indices = self.cuda_graph_kv_indices
                 create_flashinfer_kv_indices_triton[(bs,)](
                     self.req_to_token,
                     req_pool_indices,
-                    seq_lens,
+                    kv_lens,
                     kv_indptr,
                     None,
                     kv_indices,
@@ -973,22 +978,37 @@ class AiterAttnBackend(AttentionBackend):
                     # num_kv_splits_indptr=num_kv_splits_indptr,
                 )
             else:
-                seq_lens_sum = seq_lens.sum().item()
-                self.indices_updater_prefill.update(
+                # Non-MLA target_verify CUDA graph capture: use pre-allocated buffers
+                # so the CUDA graph bakes in the correct memory addresses (same as replay)
+                kv_lens = seq_lens + self.num_draft_tokens
+                kv_indptr = self.kv_indptr[: bs + 1]
+                kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
+                kv_indices = self.cuda_graph_kv_indices
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
                     req_pool_indices,
-                    seq_lens,
-                    seq_lens_sum,
-                    prefix_lens=None,
-                    encoder_lens=encoder_lens,
-                    spec_info=spec_info,
+                    kv_lens,
+                    kv_indptr,
+                    None,
+                    kv_indices,
+                    self.req_to_token.stride(0),
+                )
+                # Set up qo_indptr (num_draft_tokens queries per sequence)
+                qo_indptr = self.qo_indptr[: bs + 1]
+                qo_indptr[: bs + 1] = torch.arange(
+                    0,
+                    (1 + bs) * self.num_draft_tokens,
+                    step=self.num_draft_tokens,
+                    dtype=torch.int32,
+                    device=self.device,
                 )
                 self.forward_metadata = ForwardMetadata(
-                    self.indices_updater_prefill.kv_indptr,
-                    self.indices_updater_prefill.kv_indices,
+                    kv_indptr,
+                    kv_indices,
                     None,
                     None,
-                    self.indices_updater_prefill.max_q_len,
-                    self.indices_updater_prefill.max_kv_len,
+                    self.num_draft_tokens,
+                    kv_lens.max().item(),
                 )
         elif forward_mode.is_draft_extend():
             num_tokens_per_bs = self.speculative_num_steps + 1
@@ -1015,7 +1035,16 @@ class AiterAttnBackend(AttentionBackend):
             kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
             max_q_len = num_tokens_per_bs
 
-            if _use_mla_ps_kernel:
+            # Initialize to None for non-MLA models (max_split_per_batch only set for MLA)
+            work_metadata = None
+            work_info_set = None
+            work_indptr = None
+            reduce_indptr = None
+            reduce_final_map = None
+            reduce_partial_map = None
+            num_kv_splits = None
+
+            if _use_mla_ps_kernel and self.use_mla:
 
                 num_kv_splits = self.max_split_per_batch
 
