@@ -847,7 +847,8 @@ def buffered_multi_thread_safetensors_weights_iterator(
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
         else:
-            result = safetensors.torch.load_file(st_file, device="cpu")
+            with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
+                result = {k: f.get_tensor(k) for k in f.keys()}
         return result
 
     # Sliding window: max_workers loading + 1 prefetched.
