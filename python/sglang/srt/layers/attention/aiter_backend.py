@@ -190,10 +190,13 @@ class AiterAttnBackend(AttentionBackend):
         nbyes_per_qo_elem = torch.finfo(torch.float32).bits // 8
 
         if not self.use_mla:
+            # For paged_attention_ragged with MTP (NEXTN spec decode), workspace layout is
+            # [num_seqs * MTP * num_heads * max_num_partitions], so multiply by num_draft_tokens.
+            _ws_mtp = self.num_draft_tokens if self.num_draft_tokens is not None else 1
             self.workspace_buffer = torch.empty(
-                (max_bs * self.num_head * self.max_num_partitions * self.head_dim)
+                (max_bs * _ws_mtp * self.num_head * self.max_num_partitions * self.head_dim)
                 * nbyes_per_qo_elem
-                + 2 * (max_bs * self.num_head * self.max_num_partitions) * 4,
+                + 2 * (max_bs * _ws_mtp * self.num_head * self.max_num_partitions) * 4,
                 dtype=torch.uint8,
                 device=self.device,
             )
@@ -236,6 +239,10 @@ class AiterAttnBackend(AttentionBackend):
                 self.max_split_per_batch = 64
 
             self.fix_max_split_per_batch = self.max_split_per_batch
+
+        # Note: paged_attention_ragged kernels for speculative decoding
+        # will be JIT compiled on first use. The kernel compilation
+        # must happen outside of CUDA graph capture context.
 
     def make_mla_decode_meta_data_buffer(self, max_seqlen_qo, batch_size):
         nhead = self.num_head
@@ -603,6 +610,7 @@ class AiterAttnBackend(AttentionBackend):
                     custom_mask=custom_mask,
                     mask_indptr=None,
                     max_extend_len=draft_max_extend_len,
+                    run_graph=False,  # Non-CUDA-graph path for draft_extend
                 )
         elif forward_batch.forward_mode.is_target_verify():
             if self.use_mla:
@@ -728,6 +736,7 @@ class AiterAttnBackend(AttentionBackend):
                     custom_mask=custom_mask,
                     mask_indptr=mask_indptr,
                     max_extend_len=draft_num,
+                    run_graph=False,  # Non-CUDA-graph path for target_verify
                 )
         else:
             prefix_lens = forward_batch.extend_prefix_lens
@@ -871,6 +880,75 @@ class AiterAttnBackend(AttentionBackend):
             self.reduce_final_map = None
             self.reduce_partial_map = None
 
+        # Warmup paged_attention_ragged kernel for speculative decoding
+        # This ensures the kernel is compiled before CUDA graph capture
+        if not self.use_mla and self.num_draft_tokens is not None:
+            self._warmup_paged_attention_ragged_for_spec()
+
+    def _warmup_paged_attention_ragged_for_spec(self):
+        """Warmup paged_attention_ragged with mtp and is_causal for speculative decoding."""
+        import math
+
+        # For large head_dim (>128), MTP_PER_THREAD=MTP overflows GPU local memory.
+        # In that case we call the kernel in a loop with mtp=1, so only warmup mtp=1.
+        large_head = self.head_dim > 128
+        if large_head:
+            warmup_mtp_values = {1}
+        else:
+            warmup_mtp_values = set([self.num_draft_tokens, self.speculative_num_steps + 1])
+
+        for mtp in warmup_mtp_values:
+            # Create minimal dummy tensors for kernel compilation
+            num_seqs = 1
+            kv_len = 16
+
+            query = torch.randn(num_seqs * mtp, self.num_head, self.head_dim,
+                               dtype=self.input_dtype, device=self.device)
+            key_cache = torch.randn(kv_len, 1, self.num_kv_head, self.head_dim,
+                                   dtype=self.input_dtype, device=self.device)
+            value_cache = torch.randn(kv_len, 1, self.num_kv_head, self.head_dim,
+                                     dtype=self.input_dtype, device=self.device)
+
+            kv_indptr = torch.tensor([0, kv_len], dtype=torch.int32, device=self.device)
+            kv_page_indices = torch.arange(kv_len, dtype=torch.int32, device=self.device)
+            kv_last_page_len = torch.ones(num_seqs, dtype=torch.int32, device=self.device)
+
+            max_num_partitions = 1
+            # Workspace needs num_seqs * MTP entries (stage2 reads at seq_idx * MTP + mtp)
+            workspace_size = (num_seqs * mtp * self.num_head * max_num_partitions * self.head_dim * 2 +
+                            2 * num_seqs * mtp * self.num_head * max_num_partitions * 4)
+            workspace_buffer = torch.empty(max(workspace_size, 1024), dtype=torch.uint8, device=self.device)
+
+            k_scale = torch.tensor([1.0], dtype=torch.float32, device=self.device)
+            v_scale = torch.tensor([1.0], dtype=torch.float32, device=self.device)
+            output = torch.empty_like(query)
+
+            paged_attention_ragged(
+                output,
+                workspace_buffer,
+                query,
+                key_cache,
+                value_cache,
+                1.0 / math.sqrt(self.head_dim),
+                kv_indptr,
+                kv_page_indices,
+                kv_last_page_len,
+                1,  # block_size
+                max_num_partitions,
+                None,  # alibi_slopes
+                "auto",
+                "NHD",
+                0.0,  # logits_soft_cap
+                k_scale,
+                v_scale,
+                None,  # fp8_out_scale
+                _AITER_PARTITION_SIZE_ROCM,
+                mtp,
+                None,  # q_scale
+                True,  # is_causal
+            )
+        torch.cuda.synchronize()
+
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
@@ -968,31 +1046,34 @@ class AiterAttnBackend(AttentionBackend):
             )
 
         elif forward_mode.is_target_verify():
+            qo_indptr = self.qo_indptr[: bs + 1]
+            qo_indptr[: bs + 1] = torch.arange(
+                0,
+                (1 + bs) * self.num_draft_tokens,
+                step=self.num_draft_tokens,
+                dtype=torch.int32,
+                device=self.device,
+            )
             if self.use_mla:
-                qo_indptr = self.qo_indptr[: bs + 1]
-                qo_indptr[: bs + 1] = torch.arange(
-                    0,
-                    (1 + bs) * self.num_draft_tokens,
-                    step=self.num_draft_tokens,
-                    dtype=torch.int32,
-                    device=self.device,
-                )
-                kv_indptr = self.kv_indptr[: bs + 1]
-                kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
-                kv_indices = self.cuda_graph_kv_indices
-                create_flashinfer_kv_indices_triton[(bs,)](
-                    self.req_to_token,
-                    req_pool_indices,
-                    seq_lens,
-                    kv_indptr,
-                    None,
-                    kv_indices,
-                    self.req_to_token.stride(0),
-                )
-                kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
-                max_q_len = self.num_draft_tokens
+                kv_lens = seq_lens + self.num_draft_tokens
+            else:
+                kv_lens = seq_lens
+            kv_indptr = self.kv_indptr[: bs + 1]
+            kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
+            kv_indices = self.cuda_graph_kv_indices
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices,
+                kv_lens,
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
+            kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
+            max_q_len = self.num_draft_tokens
 
-                # if self.kv_cache_dtype == fp8_dtype:
+            if self.use_mla:
                 if _use_mla_ps_kernel:
 
                     num_kv_splits = self.max_split_per_batch
@@ -1035,37 +1116,11 @@ class AiterAttnBackend(AttentionBackend):
                     reduce_final_map=reduce_final_map,
                     reduce_partial_map=reduce_partial_map,
                     num_kv_splits=num_kv_splits,
-                    # num_kv_splits_indptr=num_kv_splits_indptr,
                 )
             else:
-                # Non-MLA target_verify cuda graph: use triton extend kernel metadata
-                draft_num = self.num_draft_tokens
-                qo_indptr = self.qo_indptr[: bs + 1]
-                qo_indptr[: bs + 1] = torch.arange(
-                    0,
-                    (1 + bs) * draft_num,
-                    step=draft_num,
-                    dtype=torch.int32,
-                    device=self.device,
-                )
-
-                kv_indptr = self.kv_indptr[: bs + 1]
-                kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
-
-                kv_indices = self.cuda_graph_kv_indices
-                create_flashinfer_kv_indices_triton[(bs,)](
-                    self.req_to_token,
-                    req_pool_indices,
-                    seq_lens,
-                    kv_indptr,
-                    None,
-                    kv_indices,
-                    self.req_to_token.stride(0),
-                )
-
                 custom_mask = self.cuda_graph_custom_mask
                 custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
-                seq_mask_len = draft_num * (seq_lens + draft_num)
+                seq_mask_len = max_q_len * (seq_lens + max_q_len)
                 mask_indptr = self.mask_indptr
                 mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
                 mask_indptr = mask_indptr[: bs + 1]
@@ -1074,12 +1129,12 @@ class AiterAttnBackend(AttentionBackend):
                     kv_indptr,
                     kv_indices,
                     qo_indptr,
-                    None,
-                    draft_num,
-                    None,
+                    kv_last_page_len,
+                    max_q_len,
+                    kv_indptr[-1].item(),
                     custom_mask=custom_mask,
                     mask_indptr=mask_indptr,
-                    max_extend_len=draft_num,
+                    max_extend_len=max_q_len,
                 )
         elif forward_mode.is_draft_extend():
             num_tokens_per_bs = self.speculative_num_steps + 1
@@ -1290,64 +1345,71 @@ class AiterAttnBackend(AttentionBackend):
                 kv_indices,
                 self.req_to_token.stride(0),
             )
-            if not self.use_mla:
-                # Non-MLA: update custom_mask and mask_indptr for triton extend kernel
-                custom_mask = self.cuda_graph_custom_mask
-                custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
-                seq_mask_len = self.num_draft_tokens * (
-                    seq_lens + self.num_draft_tokens
-                )
-                mask_indptr = self.mask_indptr[: bs + 1]
-                mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
-
             kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
             max_q_len = self.num_draft_tokens
 
-            # if self.kv_cache_dtype == fp8_dtype:
-            if _use_mla_ps_kernel:
+            if self.use_mla:
+                if _use_mla_ps_kernel:
 
-                num_kv_splits = self.max_split_per_batch
+                    num_kv_splits = self.max_split_per_batch
 
-                self.make_mla_meta_data(
-                    qo_indptr,
+                    self.make_mla_meta_data(
+                        qo_indptr,
+                        kv_indptr,
+                        kv_last_page_len,
+                        self.work_metadata,
+                        self.work_info_set,
+                        self.work_indptr,
+                        self.reduce_indptr,
+                        self.reduce_final_map,
+                        self.reduce_partial_map,
+                        max_q_len,
+                        fast_mode=fast_mode,
+                        max_split_per_batch=num_kv_splits,
+                        intra_batch_mode=intra_batch_mode,
+                    )
+
+                    work_metadata = self.work_metadata
+                    work_info_set = self.work_info_set
+                    work_indptr = self.work_indptr
+
+                    reduce_indptr = self.reduce_indptr
+                    reduce_final_map = self.reduce_final_map
+                    reduce_partial_map = self.reduce_partial_map
+
+                self.forward_metadata = ForwardMetadata(
                     kv_indptr,
+                    kv_indices,
+                    qo_indptr,
                     kv_last_page_len,
-                    self.work_metadata,
-                    self.work_info_set,
-                    self.work_indptr,
-                    self.reduce_indptr,
-                    self.reduce_final_map,
-                    self.reduce_partial_map,
                     max_q_len,
-                    fast_mode=fast_mode,
-                    max_split_per_batch=num_kv_splits,
-                    intra_batch_mode=intra_batch_mode,
+                    kv_indptr[-1].item(),
+                    work_metadata=work_metadata,
+                    work_info_set=work_info_set,
+                    work_indptr=work_indptr,
+                    reduce_indptr=reduce_indptr,
+                    reduce_final_map=reduce_final_map,
+                    reduce_partial_map=reduce_partial_map,
+                    num_kv_splits=num_kv_splits,
                 )
+            else:
+                custom_mask = self.cuda_graph_custom_mask
+                custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
+                seq_mask_len = max_q_len * (seq_lens + max_q_len)
+                mask_indptr = self.mask_indptr[: bs + 1]
+                mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
 
-                work_metadata = self.work_metadata
-                work_info_set = self.work_info_set
-                work_indptr = self.work_indptr
-
-                reduce_indptr = self.reduce_indptr
-                reduce_final_map = self.reduce_final_map
-                reduce_partial_map = self.reduce_partial_map
-
-            self.forward_metadata = ForwardMetadata(
-                kv_indptr,
-                kv_indices,
-                qo_indptr,
-                kv_last_page_len,
-                max_q_len,
-                kv_indptr[-1].item(),
-                work_metadata=work_metadata,
-                work_info_set=work_info_set,
-                work_indptr=work_indptr,
-                reduce_indptr=reduce_indptr,
-                reduce_final_map=reduce_final_map,
-                reduce_partial_map=reduce_partial_map,
-                num_kv_splits=num_kv_splits,
-                # num_kv_splits_indptr=num_kv_splits_indptr,
-            )
+                self.forward_metadata = ForwardMetadata(
+                    kv_indptr,
+                    kv_indices,
+                    qo_indptr,
+                    kv_last_page_len,
+                    max_q_len,
+                    kv_indptr[-1].item(),
+                    custom_mask=custom_mask,
+                    mask_indptr=mask_indptr,
+                    max_extend_len=max_q_len,
+                )
 
         elif forward_mode.is_draft_extend():
             num_tokens_per_bs = self.speculative_num_steps + 1
@@ -1371,7 +1433,7 @@ class AiterAttnBackend(AttentionBackend):
             kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
             max_q_len = num_tokens_per_bs
 
-            if _use_mla_ps_kernel:
+            if self.use_mla and _use_mla_ps_kernel:
 
                 num_kv_splits = self.max_split_per_batch
 
@@ -1413,7 +1475,6 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_final_map=reduce_final_map,
                 reduce_partial_map=reduce_partial_map,
                 num_kv_splits=num_kv_splits,
-                # num_kv_splits_indptr=num_kv_splits_indptr,
             )
 
         else:
@@ -1430,6 +1491,7 @@ class AiterAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
+        sinks=None,
     ):
         cache_loc = (
             forward_batch.out_cache_loc
@@ -1759,7 +1821,9 @@ class AiterAttnBackend(AttentionBackend):
                 forward_batch.forward_mode.is_target_verify()
                 or forward_batch.forward_mode.is_draft_extend()
             ):
-                # Use triton extend kernel which supports custom masks and causal masking
+                # Check if we're in CUDA graph mode
+                run_graph = getattr(self.forward_metadata, 'run_graph', True)
+                
                 if layer.qk_head_dim != layer.v_head_dim:
                     o = q.new_empty(
                         (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
@@ -1767,23 +1831,74 @@ class AiterAttnBackend(AttentionBackend):
                 else:
                     o = torch.empty_like(q)
 
-                self.extend_attention_fwd(
-                    q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                    k.contiguous(),
-                    v.contiguous(),
-                    o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                    forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-                    forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-                    self.forward_metadata.qo_indptr,
-                    self.forward_metadata.kv_indptr,
-                    self.forward_metadata.kv_indices,
-                    self.forward_metadata.custom_mask,
-                    True,  # causal
-                    self.forward_metadata.mask_indptr,
-                    self.forward_metadata.max_extend_len,
-                    layer.scaling,
-                    logit_cap=layer.logit_cap,
+                # Determine MTP count
+                if forward_batch.forward_mode.is_target_verify():
+                    mtp = self.num_draft_tokens
+                else:  # draft_extend
+                    mtp = self.speculative_num_steps + 1
+
+                k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+                    layer.layer_id
                 )
+
+                if self.kv_cache_dtype == fp8_dtype:
+                    dtype = q.dtype
+                    k_cache = k_cache.to(dtype)
+                    v_cache = v_cache.to(dtype)
+
+                # Use paged_attention_ragged with MTP for split-KV optimization
+                # This provides O(KV/num_partitions) complexity instead of O(KV)
+                # Get kv_last_page_len from forward_metadata (set in replay path)
+                kv_last_page_len = self.forward_metadata.kv_last_page_len
+                if kv_last_page_len is None:
+                    kv_last_page_len = self.kv_last_page_len[:forward_batch.batch_size]
+
+                q_3d = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                o_3d = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+                k_4d = k_cache.view(-1, 1, layer.tp_k_head_num, layer.qk_head_dim)
+                v_4d = v_cache.view(-1, 1, layer.tp_v_head_num, layer.v_head_dim)
+
+                # For large head_dim (>128), MTP_PER_THREAD=MTP overflows GPU local memory.
+                # Work around by calling the kernel once per MTP token with mtp=1.
+                if layer.qk_head_dim > 128 and mtp > 1:
+                    num_seqs = q_3d.shape[0] // mtp
+                    for mtp_idx in range(mtp):
+                        q_slice = q_3d[mtp_idx::mtp].contiguous()
+                        o_slice = torch.empty(num_seqs, layer.tp_q_head_num, layer.v_head_dim,
+                                              dtype=o.dtype, device=o.device)
+                        paged_attention_ragged(
+                            o_slice, self.workspace_buffer, q_slice,
+                            k_4d, v_4d, layer.scaling,
+                            self.forward_metadata.kv_indptr,
+                            self.forward_metadata.kv_indices,
+                            kv_last_page_len, self.page_size, self.max_num_partitions,
+                            None, "auto", "NHD",
+                            layer.logit_cap if layer.logit_cap else 0.0,
+                            self.k_scale, self.v_scale, None,
+                            _AITER_PARTITION_SIZE_ROCM, 1, None, False,
+                        )
+                        o_3d[mtp_idx::mtp].copy_(o_slice)
+                else:
+                    paged_attention_ragged(
+                        o_3d, self.workspace_buffer, q_3d, k_4d, v_4d,
+                        layer.scaling,
+                        self.forward_metadata.kv_indptr,
+                        self.forward_metadata.kv_indices,
+                        kv_last_page_len,
+                        self.page_size,
+                        self.max_num_partitions,
+                        None,  # alibi_slopes
+                        "auto",
+                        "NHD",
+                        layer.logit_cap if layer.logit_cap else 0.0,
+                        self.k_scale,
+                        self.v_scale,
+                        None,  # fp8_out_scale
+                        _AITER_PARTITION_SIZE_ROCM,
+                        mtp,
+                        None,  # q_scale
+                        True,  # is_causal
+                    )
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
             k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
@@ -1797,6 +1912,10 @@ class AiterAttnBackend(AttentionBackend):
                 dtype = q.dtype
                 k_cache = k_cache.to(dtype)
                 v_cache = v_cache.to(dtype)
+
+            window_size = (-1, -1)
+            if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+                window_size = (layer.sliding_window_size, -1)
 
             o = mha_batch_prefill_func(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -1812,6 +1931,8 @@ class AiterAttnBackend(AttentionBackend):
                 alibi_slopes=None,
                 return_lse=False,
                 return_attn_probs=False,
+                window_size=window_size,
+                sink_ptr=sinks,
             )
 
             return o.view(-1, layer.tp_q_head_num * layer.head_dim)

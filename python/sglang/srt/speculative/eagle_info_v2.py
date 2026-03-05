@@ -42,7 +42,7 @@ if TYPE_CHECKING:
     )
     from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 
-if is_cuda():
+if is_cuda() or is_hip():
     from sgl_kernel import (
         top_k_renorm_prob,
         top_p_renorm_prob,
