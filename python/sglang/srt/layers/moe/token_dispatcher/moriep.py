@@ -342,6 +342,7 @@ class _MoriEPDispatcherImplBase:
         params_dtype: torch.dtype,
         deepep_mode: DeepEPMode,
         instance_id: int = 0,
+        is_nextn: bool = False,
     ):
         try:
             import mori  # noqa: F401
@@ -356,6 +357,7 @@ class _MoriEPDispatcherImplBase:
         self.params_dtype = params_dtype
         self.deepep_mode = deepep_mode
         self.instance_id = instance_id
+        self.is_nextn = is_nextn
 
         self.num_max_dispatch_tokens_per_rank = get_int_env_var(
             "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
@@ -392,23 +394,40 @@ class _MoriEPDispatcherImplBase:
         return self._mori_op
 
     def _apply_dispatch_dtype_override(self):
-        """Apply env var override to fp8_dispatch/fp4_dispatch flags."""
-        if "SGLANG_MORI_DISPATCH_DTYPE" in os.environ:
-            dispatch_dtype = os.environ["SGLANG_MORI_DISPATCH_DTYPE"].lower()
+        """Apply env var override to fp8_dispatch/fp4_dispatch flags.
+
+        When is_nextn is True, NEXTN-specific env vars take priority so that
+        the draft model can use a different dispatch dtype than the target model.
+        """
+        # Check NEXTN-specific env vars first when applicable
+        dtype_var = "SGLANG_MORI_DISPATCH_DTYPE"
+        fp8_var = "SGLANG_MORI_FP8_DISP"
+        fp4_var = "SGLANG_MORI_FP4_DISP"
+        if self.is_nextn:
+            if "SGLANG_MORI_NEXTN_DISPATCH_DTYPE" in os.environ:
+                dtype_var = "SGLANG_MORI_NEXTN_DISPATCH_DTYPE"
+            elif (
+                "SGLANG_MORI_NEXTN_FP8_DISP" in os.environ
+                or "SGLANG_MORI_NEXTN_FP4_DISP" in os.environ
+            ):
+                fp8_var = "SGLANG_MORI_NEXTN_FP8_DISP"
+                fp4_var = "SGLANG_MORI_NEXTN_FP4_DISP"
+
+        if dtype_var in os.environ:
+            dispatch_dtype = os.environ[dtype_var].lower()
             if dispatch_dtype != "auto":
                 self.fp8_dispatch = dispatch_dtype == "fp8"
                 self.fp4_dispatch = dispatch_dtype == "fp4"
-        elif (
-            "SGLANG_MORI_FP8_DISP" in os.environ or "SGLANG_MORI_FP4_DISP" in os.environ
-        ):
-            # Deprecated: will be removed in a future release
-            logger.warning_once(
-                "SGLANG_MORI_FP8_DISP and SGLANG_MORI_FP4_DISP are deprecated "
-                "and will be removed in a future release. "
-                "Use SGLANG_MORI_DISPATCH_DTYPE=auto|bf16|fp8|fp4 instead."
-            )
-            self.fp8_dispatch = get_bool_env_var("SGLANG_MORI_FP8_DISP", "False")
-            self.fp4_dispatch = get_bool_env_var("SGLANG_MORI_FP4_DISP", "False")
+        elif fp8_var in os.environ or fp4_var in os.environ:
+            if fp8_var.startswith("SGLANG_MORI_FP"):
+                # Deprecated: will be removed in a future release
+                logger.warning_once(
+                    "SGLANG_MORI_FP8_DISP and SGLANG_MORI_FP4_DISP are deprecated "
+                    "and will be removed in a future release. "
+                    "Use SGLANG_MORI_DISPATCH_DTYPE=auto|bf16|fp8|fp4 instead."
+                )
+            self.fp8_dispatch = get_bool_env_var(fp8_var, "False")
+            self.fp4_dispatch = get_bool_env_var(fp4_var, "False")
 
     def dispatch_a(
         self,
@@ -911,6 +930,7 @@ class MoriEPDispatcher(BaseDispatcher):
         async_finish: bool = False,
         return_recv_hook: bool = False,
         instance_id: int = 0,
+        is_nextn: bool = False,
     ):
         super().__init__()
 
@@ -926,6 +946,7 @@ class MoriEPDispatcher(BaseDispatcher):
             params_dtype=params_dtype,
             deepep_mode=deepep_mode,
             instance_id=instance_id,
+            is_nextn=is_nextn,
         )
 
         if self.deepep_mode.enable_low_latency():

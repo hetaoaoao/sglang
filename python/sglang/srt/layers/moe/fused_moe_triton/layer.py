@@ -86,7 +86,7 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
         or a2a_backend.is_mori()
         or a2a_backend.is_nixl()
     ):
-        return MaybeTboDeepEPDispatcher(
+        kwargs = dict(
             group=(
                 get_tp_group().device_group
                 if not a2a_backend.is_mori()
@@ -102,6 +102,9 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             async_finish=True,
             return_recv_hook=True,
         )
+        if a2a_backend.is_mori():
+            kwargs["is_nextn"] = moe_runner_config.is_nextn
+        return MaybeTboDeepEPDispatcher(**kwargs)
     elif a2a_backend.is_ascend_fuseep():
         from sglang.srt.layers.moe.token_dispatcher import NpuFuseEPDispatcher
 
