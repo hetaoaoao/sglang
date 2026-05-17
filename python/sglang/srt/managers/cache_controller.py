@@ -669,6 +669,7 @@ class HiCacheController:
         self.ack_write_queue.clear()
         self.ack_load_queue.clear()
         self.last_load_producer_id = -1
+        self.last_write_finish_event = None
         if self.enable_storage:
             self.prefetch_thread.join()
             self.backup_thread.join()
