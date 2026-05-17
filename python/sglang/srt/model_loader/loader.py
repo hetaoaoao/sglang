@@ -87,7 +87,6 @@ DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_loader.weight_utils import (
-    buffered_multi_thread_safetensors_weights_iterator,
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
     fastsafetensors_weights_iterator,
@@ -98,6 +97,7 @@ from sglang.srt.model_loader.weight_utils import (
     gguf_quant_weights_iterator,
     initialize_dummy_weights,
     maybe_add_mtp_safetensors,
+    multi_thread_safetensors_weights_iterator,
     multi_thread_pt_weights_iterator,
     np_cache_weights_iterator,
     pt_weights_iterator,
@@ -537,14 +537,16 @@ class DefaultModelLoader(BaseModelLoader):
                     hf_weights_files,
                 )
             elif use_multithread:
-                weights_iterator = buffered_multi_thread_safetensors_weights_iterator(
+                # The buffered iterator reduces peak host memory, but on our CephFS
+                # model store it serializes too much IO and makes GLM-5.1 startup
+                # dramatically slower. Keep the older eager multi-thread shard loader
+                # for this image line.
+                weights_iterator = multi_thread_safetensors_weights_iterator(
                     hf_weights_files,
                     max_workers=extra_config.get(
                         "num_threads", self.DEFAULT_NUM_THREADS
                     ),
                     disable_mmap=weight_loader_disable_mmap,
-                    prefetch=weight_loader_prefetch,
-                    prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
                 )
             else:
