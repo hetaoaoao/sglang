@@ -271,6 +271,8 @@ class HybridCacheController(BaseHiCacheController):
         finish_event = device_module.Event()
         start_event.record()
         with device_module.stream(self.write_stream):
+            if self.producer_stream is not None:
+                self.write_stream.wait_stream(self.producer_stream)
             start_event.wait(self.write_stream)
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device,
@@ -279,7 +281,24 @@ class HybridCacheController(BaseHiCacheController):
                 self.io_backend,
                 pool_transfers=resolved_pool_transfers,
             )
+            if self.has_draft:
+                if hasattr(self.mem_pool_host_draft, "entries"):
+                    self.mem_pool_host_draft.backup_from_device_all_layer(
+                        self.mem_pool_device_draft,
+                        host_indices,
+                        device_indices,
+                        self.io_backend,
+                        pool_transfers=resolved_pool_transfers,
+                    )
+                else:
+                    self.mem_pool_host_draft.backup_from_device_all_layer(
+                        self.mem_pool_device_draft,
+                        host_indices,
+                        device_indices,
+                        self.io_backend,
+                    )
             finish_event.record()
+            self.last_write_finish_event = finish_event
             self._record_transfer_indices_on_stream(
                 self.write_stream,
                 host_indices,
@@ -333,7 +352,7 @@ class HybridCacheController(BaseHiCacheController):
 
     def start_loading(self) -> int:
         if not self.load_queue:
-            return -1
+            return self.last_load_producer_id if self.ack_load_queue else -1
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
         host_indices, device_indices, resolved_pool_transfers = (
@@ -353,6 +372,31 @@ class HybridCacheController(BaseHiCacheController):
                     self.io_backend,
                     pool_transfers=resolved_pool_transfers,
                 )
+                draft_layer_num = getattr(
+                    self.mem_pool_host_draft,
+                    "layer_num",
+                    getattr(self.mem_pool_host_draft.anchor_entry.host_pool, "layer_num", 0)
+                    if hasattr(self.mem_pool_host_draft, "anchor_entry")
+                    else 0,
+                )
+                if self.has_draft and i < draft_layer_num:
+                    if hasattr(self.mem_pool_host_draft, "entries"):
+                        self.mem_pool_host_draft.load_to_device_per_layer(
+                            self.mem_pool_device_draft,
+                            host_indices,
+                            device_indices,
+                            i,
+                            self.io_backend,
+                            pool_transfers=resolved_pool_transfers,
+                        )
+                    else:
+                        self.mem_pool_host_draft.load_to_device_per_layer(
+                            self.mem_pool_device_draft,
+                            host_indices,
+                            device_indices,
+                            i,
+                            self.io_backend,
+                        )
                 producer_event.complete(i)
             self._record_transfer_indices_on_stream(
                 self.load_stream,
@@ -367,6 +411,7 @@ class HybridCacheController(BaseHiCacheController):
                 op.node_ids,
             )
         )
+        self.last_load_producer_id = producer_id
         return producer_id
 
     def _record_transfer_indices_on_stream(

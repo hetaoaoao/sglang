@@ -319,6 +319,7 @@ class HiCacheController:
         self.write_queue: List[CacheOperation] = []
         self.ack_load_queue: List[HiCacheAck] = []
         self.ack_write_queue: List[HiCacheAck] = []
+        self.last_load_producer_id = -1
 
         self.stop_event = threading.Event()
         self.write_buffer = TransferBuffer(self.stop_event)
@@ -328,6 +329,8 @@ class HiCacheController:
 
         self.write_stream = device_module.Stream()
         self.load_stream = device_module.Stream()
+        self.producer_stream = None
+        self.last_write_finish_event = None
 
         # If a storage backend is provided at startup, treat it as an implicit attach,
         # so init/runtime share the same lifecycle semantics and code paths.
@@ -665,6 +668,7 @@ class HiCacheController:
         self.load_buffer.clear()
         self.ack_write_queue.clear()
         self.ack_load_queue.clear()
+        self.last_load_producer_id = -1
         if self.enable_storage:
             self.prefetch_thread.join()
             self.backup_thread.join()
@@ -685,6 +689,9 @@ class HiCacheController:
             )
             self.prefetch_thread.start()
             self.backup_thread.start()
+
+    def set_producer_stream(self, stream):
+        self.producer_stream = stream
 
     def write(
         self,
@@ -719,6 +726,8 @@ class HiCacheController:
 
         start_event.record()
         with device_module.stream(self.write_stream):
+            if self.producer_stream is not None:
+                self.write_stream.wait_stream(self.producer_stream)
             start_event.wait(self.write_stream)
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device, host_indices, device_indices, self.io_backend
@@ -731,6 +740,7 @@ class HiCacheController:
                     self.io_backend,
                 )
             finish_event.record()
+            self.last_write_finish_event = finish_event
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
             # still alive when the write stream is executing.
@@ -782,7 +792,7 @@ class HiCacheController:
 
     def start_loading(self) -> int:
         if len(self.load_queue) == 0:
-            return -1
+            return self.last_load_producer_id if self.ack_load_queue else -1
 
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
@@ -827,6 +837,7 @@ class HiCacheController:
                 node_ids=op.node_ids,
             )
         )
+        self.last_load_producer_id = producer_id
         return producer_id
 
     def evict_device(self, device_indices: torch.Tensor) -> int:

@@ -920,6 +920,9 @@ class Scheduler(
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
                 )
+                self.tree_cache.cache_controller.set_producer_stream(
+                    self.forward_stream
+                )
             elif self.is_hybrid_swa:
                 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 
@@ -1002,10 +1005,17 @@ class Scheduler(
             HybridLinearKVPool,
             MHATokenToKVPool,
             MLATokenToKVPool,
+            NSATokenToKVPool,
         )
         from sglang.srt.mem_cache.memory_pool_host import (
+            HostPoolGroup,
             MHATokenToKVPoolHost,
             MLATokenToKVPoolHost,
+            NSAIndexerPoolHost,
+        )
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+            build_pool_entry,
         )
 
         pool = draft_kv_pool
@@ -1021,7 +1031,38 @@ class Scheduler(
             page_size=self.page_size,
             layout=self.server_args.hicache_mem_layout,
         )
-        if isinstance(pool, MHATokenToKVPool):
+        if isinstance(pool, NSATokenToKVPool):
+            draft_kv_host_pool = MLATokenToKVPoolHost(
+                pool, override_kv_cache_dim=pool.kv_cache_dim, **kw
+            )
+            draft_indexer_host_pool = NSAIndexerPoolHost(
+                pool,
+                draft_kv_host_pool,
+                self.server_args.hicache_mem_layout,
+                allocator_type=self.server_args.hicache_storage_backend or "default",
+            )
+            layer_mapping = {layer_id: layer_id for layer_id in range(pool.layer_num)}
+            draft_host_pool = HostPoolGroup(
+                [
+                    build_pool_entry(
+                        name=PoolName.KV,
+                        host_pool=draft_kv_host_pool,
+                        device_pool=pool,
+                        layer_mapping=layer_mapping,
+                        transfer_layer_num=pool.layer_num,
+                        is_anchor=True,
+                    ),
+                    build_pool_entry(
+                        name=PoolName.INDEXER,
+                        host_pool=draft_indexer_host_pool,
+                        device_pool=pool,
+                        layer_mapping=layer_mapping,
+                        transfer_layer_num=pool.layer_num,
+                        share_indices_with_anchor=True,
+                    ),
+                ]
+            )
+        elif isinstance(pool, MHATokenToKVPool):
             draft_host_pool = MHATokenToKVPoolHost(pool, **kw)
         elif isinstance(pool, MLATokenToKVPool):
             draft_host_pool = MLATokenToKVPoolHost(pool, **kw)
@@ -2965,6 +3006,16 @@ class Scheduler(
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
         self.batch_record_buf[self.batch_record_ct] = model_worker_batch
 
+    def _wait_hicache_write_finish(self):
+        if not self.enable_hierarchical_cache:
+            return
+        cache_controller = getattr(
+            getattr(self, "tree_cache", None), "cache_controller", None
+        )
+        finish_event = getattr(cache_controller, "last_write_finish_event", None)
+        if finish_event is not None:
+            self.forward_stream.wait_event(finish_event)
+
     def run_batch(
         self,
         batch: ScheduleBatch,
@@ -3007,6 +3058,7 @@ class Scheduler(
 
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
+                    self._wait_hicache_write_finish()
                     self.future_map.resolve_future(model_worker_batch)
                     batch_result = self.model_worker.forward_batch_generation(
                         model_worker_batch
@@ -3118,6 +3170,7 @@ class Scheduler(
 
         with self.forward_stream_ctx:
             self.forward_stream.wait_stream(self.schedule_stream)
+            self._wait_hicache_write_finish()
             _batch_result = batch_result.delay_sample_func()
             assert _batch_result is batch_result
             self.future_map.store_to_map(batch_result.future_indices, batch_result)
