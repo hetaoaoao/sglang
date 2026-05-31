@@ -1850,7 +1850,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         assert index_head_dim == 128
 
         if _is_hip:
-            assert self.page_size == 1
+            assert self.page_size == 64
         else:
             assert self.page_size == 64
         with (

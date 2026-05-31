@@ -1580,9 +1580,9 @@ class ServerArgs:
                             )
 
                     if is_hip():
-                        self.page_size = 1
+                        self.page_size = 64
                         logger.warning(
-                            "Setting page size to 1 for DeepSeek DSA on ROCm."
+                            "Setting page size to 64 for DeepSeek DSA on ROCm (gfx95)."
                         )
                     else:
                         # For CUDA GPU
