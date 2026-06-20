@@ -343,15 +343,24 @@ class DeepseekSparseAttnBackend(
 
         self._arange_buf = torch.arange(16384, device=self.device, dtype=torch.int32)
 
+        # Speculative decoding
+        self.topk = model_runner.server_args.speculative_eagle_topk or 0
+        self.speculative_num_steps = speculative_num_steps
+        self.speculative_num_draft_tokens = (
+            model_runner.server_args.speculative_num_draft_tokens
+        )
+        self.speculative_step_id = speculative_step_id
+
         if _is_hip:
             max_bs = model_runner.req_to_token_pool.size
+            max_decode_rows = max_bs * max(self.speculative_num_draft_tokens or 1, 1)
 
             self.kv_indptr = torch.zeros(
-                (max_bs + 1,), dtype=torch.int32, device=model_runner.device
+                (max_decode_rows + 1,), dtype=torch.int32, device=model_runner.device
             )
 
             self.kv_indices = torch.zeros(
-                max_bs * self.dsa_index_topk,
+                max_decode_rows * self.dsa_index_topk,
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -361,14 +370,6 @@ class DeepseekSparseAttnBackend(
             self.head_repeat_factor = (
                 16 // self.num_q_heads if self.num_q_heads < 16 else 1
             )
-
-        # Speculative decoding
-        self.topk = model_runner.server_args.speculative_eagle_topk or 0
-        self.speculative_num_steps = speculative_num_steps
-        self.speculative_num_draft_tokens = (
-            model_runner.server_args.speculative_num_draft_tokens
-        )
-        self.speculative_step_id = speculative_step_id
 
         self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
@@ -1984,12 +1985,29 @@ class DeepseekSparseAttnBackend(
 
         kv_indptr = self.kv_indptr
 
+        attn_rows = page_table_1.shape[0]
+        assert q_kernel.shape[0] == attn_rows, (
+            f"{q_kernel.shape[0]=}, "
+            f"{attn_rows=}"
+        )
+        assert metadata.cu_seqlens_q.numel() == attn_rows + 1, (
+            f"{metadata.cu_seqlens_q.numel()=}, expected={attn_rows + 1}"
+        )
+        assert self.kv_indptr.numel() >= attn_rows + 1, (
+            f"{self.kv_indptr.numel()=}, "
+            f"required={attn_rows + 1}"
+        )
+        assert self.kv_indices.numel() >= attn_rows * page_table_1.shape[1], (
+            f"{self.kv_indices.numel()=}, "
+            f"required={attn_rows * page_table_1.shape[1]}"
+        )
+
         non_minus1_mask = page_table_1 != -1
         non_minus1_counts = non_minus1_mask.sum(dim=1)
-        kv_indptr[1 : bs + 1] = torch.cumsum(non_minus1_counts, dim=0)
+        kv_indptr[1 : attn_rows + 1] = torch.cumsum(non_minus1_counts, dim=0)
 
         kv_indices = self.kv_indices
-        get_valid_kv_indices(page_table_1, kv_indptr, kv_indices, bs)
+        get_valid_kv_indices(page_table_1, kv_indptr, kv_indices, attn_rows)
 
         mla_decode_fwd(
             q_kernel,
