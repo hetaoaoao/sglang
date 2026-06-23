@@ -290,6 +290,7 @@ class HiCacheController:
         self.has_draft = False
         self.mem_pool_device_draft = None
         self.mem_pool_host_draft = None
+        self.mem_pool_host_draft_indexer = None
         self.draft_page_get_func = None
         self.draft_page_set_func = None
 
@@ -863,11 +864,12 @@ class HiCacheController:
         self.mem_pool_host.free(host_indices)
         return len(host_indices)
 
-    def set_draft_kv_pool(self, draft_device_pool, draft_host_pool) -> None:
+    def set_draft_kv_pool(self, draft_device_pool, draft_host_pool, draft_indexer_host_pool=None) -> None:
         """Register draft KV pools so L2/L3 ops piggyback draft transfers."""
         self.has_draft = True
         self.mem_pool_device_draft = draft_device_pool
         self.mem_pool_host_draft = draft_host_pool
+        self.mem_pool_host_draft_indexer = draft_indexer_host_pool
         logger.info(
             "HiCache draft KV registered: %s (host %d slots)",
             type(draft_device_pool).__name__,

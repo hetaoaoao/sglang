@@ -425,6 +425,13 @@ class HybridCacheController(BaseHiCacheController):
                     device_indices,
                     self.io_backend,
                 )
+                if self.mem_pool_host_draft_indexer is not None:
+                    self.mem_pool_host_draft_indexer.backup_from_device_all_layer(
+                        self.mem_pool_device_draft,
+                        host_indices,
+                        device_indices,
+                        self.io_backend,
+                    )
             finish_event.record()
             self._record_transfer_indices_on_stream(
                 self.write_stream,
@@ -505,6 +512,18 @@ class HybridCacheController(BaseHiCacheController):
                     and i < self.mem_pool_host_draft.layer_num
                 ):
                     self.mem_pool_host_draft.load_to_device_per_layer(
+                        self.mem_pool_device_draft,
+                        host_indices,
+                        device_indices,
+                        i,
+                        self.io_backend,
+                    )
+                if (
+                    self.mem_pool_host_draft_indexer is not None
+                    and host_indices.numel() > 0
+                    and i < self.mem_pool_host_draft_indexer.layer_num
+                ):
+                    self.mem_pool_host_draft_indexer.load_to_device_per_layer(
                         self.mem_pool_device_draft,
                         host_indices,
                         device_indices,
